@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+CONFIG_DIR="${TERMCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/termcode}"
+ROOTS_FILE="$CONFIG_DIR/roots"
+ALIASES_FILE="$CONFIG_DIR/aliases"
+
+usage() {
+  cat <<EOF
+termcode - jump into and run scripts for local projects
+
+Usage:
+  termcode set <paths...>                 Save project search roots
+  termcode ls                             List discovered projects
+  termcode rename <name-or-path> <alias>  Create a callable alias
+  termcode open <project>                 Open project folder in Finder
+  termcode . <project>                    Open project folder in VS Code
+  termcode <project> <script> [args...]   Run a package script in a project
+  termcode --help                         Show help
+  termcode --version                      Show version
+
+Config:
+  $CONFIG_DIR
+EOF
+}
+
+die() {
+  printf 'termcode: %s\n' "$*" >&2
+  exit 1
+}
+
+usage_error() {
+  printf 'termcode: %s\n\n' "$*" >&2
+  usage >&2
+  exit 64
+}
+
+ensure_config_dir() {
+  mkdir -p "$CONFIG_DIR"
+  [ -f "$ROOTS_FILE" ] || : > "$ROOTS_FILE"
+  [ -f "$ALIASES_FILE" ] || : > "$ALIASES_FILE"
+}
+
+expand_path() {
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${1#"~/"}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+canonical_dir() {
+  local input expanded
+  input="$1"
+  expanded="$(expand_path "$input")"
+  [ -d "$expanded" ] || die "directory does not exist: $input"
+  (cd "$expanded" && pwd -P)
+}
+
+basename_of() {
+  local path
+  path="${1%/}"
+  printf '%s\n' "${path##*/}"
+}
+
+has_package_json() {
+  [ -f "$1/package.json" ]
+}
+
+validate_alias() {
+  case "$1" in
+    ""|*/*|*[[:space:]]*)
+      die "alias must be a non-empty name without slashes or whitespace"
+      ;;
+  esac
+}
+
+set_roots() {
+  [ "$#" -gt 0 ] || usage_error "set requires at least one path"
+  ensure_config_dir
+
+  local tmp root canonical already
+  tmp="$ROOTS_FILE.tmp.$$"
+  : > "$tmp"
+
+  for root in "$@"; do
+    canonical="$(canonical_dir "$root")"
+    already=0
+    if grep -Fxq "$canonical" "$tmp"; then
+      already=1
+    fi
+    if [ "$already" -eq 0 ]; then
+      printf '%s\n' "$canonical" >> "$tmp"
+    fi
+  done
+
+  mv "$tmp" "$ROOTS_FILE"
+  printf 'Saved %s project root%s.\n' "$#" "$(if [ "$#" -eq 1 ]; then printf ''; else printf 's'; fi)"
+}
+
+iter_projects() {
+  [ -f "$ROOTS_FILE" ] || return 0
+
+  local root child name
+  while IFS= read -r root || [ -n "$root" ]; do
+    [ -n "$root" ] || continue
+    [ -d "$root" ] || continue
+    for child in "$root"/*; do
+      [ -d "$child" ] || continue
+      has_package_json "$child" || continue
+      name="$(basename_of "$child")"
+      printf '%s\t%s\n' "$name" "$(canonical_dir "$child")"
+    done
+  done < "$ROOTS_FILE"
+}
+
+iter_aliases() {
+  [ -f "$ALIASES_FILE" ] || return 0
+
+  local alias path
+  while IFS="$(printf '\t')" read -r alias path || [ -n "${alias:-}" ]; do
+    [ -n "${alias:-}" ] || continue
+    [ -n "${path:-}" ] || continue
+    [ -d "$path" ] || continue
+    has_package_json "$path" || continue
+    printf '%s\t%s\n' "$alias" "$(canonical_dir "$path")"
+  done < "$ALIASES_FILE"
+}
+
+iter_callables() {
+  iter_projects
+  iter_aliases
+}
+
+detect_duplicates() {
+  local duplicate_count
+  duplicate_count="$(
+    iter_callables | awk -F '\t' '
+      {
+        key = $1
+        path = $2
+        if (seen[key, path] == 0) {
+          seen[key, path] = 1
+          count[key] += 1
+          paths[key] = paths[key] sprintf("  %s\n", path)
+        }
+      }
+      END {
+        duplicates = 0
+        for (key in count) {
+          if (count[key] > 1) {
+            duplicates += 1
+            printf "termcode: duplicate project name \"%s\":\n%s", key, paths[key] > "/dev/stderr"
+          }
+        }
+        print duplicates
+      }
+    '
+  )"
+  [ "$duplicate_count" -eq 0 ]
+}
+
+list_projects() {
+  ensure_config_dir
+
+  if ! detect_duplicates; then
+    exit 65
+  fi
+
+  iter_callables | sort -f -u -t "$(printf '\t')" -k1,1 | awk -F '\t' '{ printf "%-24s %s\n", $1, $2 }'
+}
+
+resolve_path_input() {
+  local input path
+  input="$1"
+  path="$(expand_path "$input")"
+  if [ -d "$path" ]; then
+    path="$(canonical_dir "$path")"
+    if has_package_json "$path"; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+    die "not a package project: $input"
+  fi
+  return 1
+}
+
+resolve_project() {
+  local query matches tmp path count
+  query="$1"
+  ensure_config_dir
+
+  if resolve_path_input "$query"; then
+    return 0
+  fi
+
+  tmp="$CONFIG_DIR/.matches.$$"
+  : > "$tmp"
+
+  iter_callables | awk -F '\t' -v query="$query" '$1 == query { print $2 }' | sort -u > "$tmp"
+  count="$(wc -l < "$tmp" | tr -d ' ')"
+
+  case "$count" in
+    0)
+      rm -f "$tmp"
+      die "project not found: $query"
+      ;;
+    1)
+      path="$(sed -n '1p' "$tmp")"
+      rm -f "$tmp"
+      printf '%s\n' "$path"
+      ;;
+    *)
+      printf 'termcode: ambiguous project name "%s":\n' "$query" >&2
+      while IFS= read -r matches; do
+        printf '  %s\n' "$matches" >&2
+      done < "$tmp"
+      rm -f "$tmp"
+      exit 65
+      ;;
+  esac
+}
+
+alias_conflicts() {
+  local alias target conflicts
+  alias="$1"
+  target="$2"
+  conflicts="$(iter_callables | awk -F '\t' -v alias="$alias" -v target="$target" '$1 == alias && $2 != target { print $2 }' | sort -u)"
+  [ -z "$conflicts" ]
+}
+
+rename_project() {
+  [ "$#" -eq 2 ] || usage_error "rename requires a project and a new alias"
+  ensure_config_dir
+
+  local target new_alias tmp alias path
+  target="$(resolve_project "$1")"
+  new_alias="$2"
+  validate_alias "$new_alias"
+
+  if ! alias_conflicts "$new_alias" "$target"; then
+    die "alias conflicts with another project: $new_alias"
+  fi
+
+  tmp="$ALIASES_FILE.tmp.$$"
+  : > "$tmp"
+  while IFS="$(printf '\t')" read -r alias path || [ -n "${alias:-}" ]; do
+    [ -n "${alias:-}" ] || continue
+    [ -n "${path:-}" ] || continue
+    [ "$alias" = "$new_alias" ] && continue
+    [ "$path" = "$target" ] && continue
+    printf '%s\t%s\n' "$alias" "$path" >> "$tmp"
+  done < "$ALIASES_FILE"
+  printf '%s\t%s\n' "$new_alias" "$target" >> "$tmp"
+  mv "$tmp" "$ALIASES_FILE"
+
+  printf 'Renamed %s to %s.\n' "$(basename_of "$target")" "$new_alias"
+}
+
+open_project() {
+  [ "$#" -eq 1 ] || usage_error "open requires a project"
+  local target
+  target="$(resolve_project "$1")"
+  command open "$target"
+}
+
+code_project() {
+  [ "$#" -eq 1 ] || usage_error ". requires a project"
+  local target
+  target="$(resolve_project "$1")"
+  if command -v code >/dev/null 2>&1; then
+    command code "$target"
+  else
+    command open -a "Visual Studio Code" "$target"
+  fi
+}
+
+detect_runner() {
+  local target
+  target="$1"
+
+  if [ -f "$target/bun.lockb" ] || [ -f "$target/bun.lock" ]; then
+    printf 'bun\n'
+  elif [ -f "$target/pnpm-lock.yaml" ]; then
+    printf 'pnpm\n'
+  elif [ -f "$target/yarn.lock" ]; then
+    printf 'yarn\n'
+  elif [ -f "$target/package-lock.json" ] || [ -f "$target/npm-shrinkwrap.json" ]; then
+    printf 'npm\n'
+  else
+    printf 'npm\n'
+  fi
+}
+
+run_script() {
+  [ "$#" -ge 2 ] || usage_error "script execution requires a project and script"
+
+  local project script target runner
+  project="$1"
+  script="$2"
+  shift 2
+
+  target="$(resolve_project "$project")"
+  runner="$(detect_runner "$target")"
+
+  printf 'Running %s via %s in %s\n' "$script" "$runner" "$target" >&2
+  if [ "$#" -gt 0 ]; then
+    (cd "$target" && command "$runner" run "$script" -- "$@")
+  else
+    (cd "$target" && command "$runner" run "$script")
+  fi
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help|"")
+      usage
+      ;;
+    -v|--version)
+      printf 'termcode %s\n' "$VERSION"
+      ;;
+    set)
+      shift
+      set_roots "$@"
+      ;;
+    ls)
+      shift
+      [ "$#" -eq 0 ] || usage_error "ls does not accept arguments"
+      list_projects
+      ;;
+    rename)
+      shift
+      rename_project "$@"
+      ;;
+    open)
+      shift
+      open_project "$@"
+      ;;
+    .)
+      shift
+      code_project "$@"
+      ;;
+    *)
+      run_script "$@"
+      ;;
+  esac
+}
+
+main "$@"
